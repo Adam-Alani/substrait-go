@@ -2090,6 +2090,216 @@ func (wr *NamedTableWriteRel) Remap(mapping ...int32) (Rel, error) {
 	return RemapHelper(wr, mapping)
 }
 
+type DdlObject = proto.DdlRel_DdlObject
+type DdlOp = proto.DdlRel_DdlOp
+
+const (
+	DdlObjectUnspecified = proto.DdlRel_DDL_OBJECT_UNSPECIFIED
+	DdlObjectTable       = proto.DdlRel_DDL_OBJECT_TABLE
+	DdlObjectView        = proto.DdlRel_DDL_OBJECT_VIEW
+)
+
+const (
+	DdlOpUnspecified     = proto.DdlRel_DDL_OP_UNSPECIFIED
+	DdlOpCreate          = proto.DdlRel_DDL_OP_CREATE
+	DdlOpCreateOrReplace = proto.DdlRel_DDL_OP_CREATE_OR_REPLACE
+	DdlOpAlter           = proto.DdlRel_DDL_OP_ALTER
+	DdlOpDrop            = proto.DdlRel_DDL_OP_DROP
+	DdlOpDropIfExist     = proto.DdlRel_DDL_OP_DROP_IF_EXIST
+)
+
+type DdlWriteType interface {
+	isDdlWriteType()
+}
+
+type NamedObjectDdlWrite struct {
+	Names             []string
+	AdvancedExtension *extensions.AdvancedExtension
+}
+
+func (*NamedObjectDdlWrite) isDdlWriteType() {}
+
+type ExtensionObjectDdlWrite struct {
+	Detail *anypb.Any
+}
+
+func (*ExtensionObjectDdlWrite) isDdlWriteType() {}
+
+// DdlRel represents a Data Definition Language (DDL) operation such as
+// CREATE TABLE, DROP VIEW, ALTER TABLE, etc.
+type DdlRel struct {
+	RelCommon
+
+	writeType      DdlWriteType
+	tableSchema    types.NamedStruct
+	tableDefaults  expr.Expression // Expression.Literal.Struct
+	object         DdlObject
+	op             DdlOp
+	viewDefinition Rel
+	advExtension   *extensions.AdvancedExtension
+}
+
+func (dr *DdlRel) directOutputSchema() types.RecordType {
+	switch dr.op {
+	case DdlOpCreate, DdlOpCreateOrReplace, DdlOpAlter:
+		if dr.object == DdlObjectTable {
+			return *types.NewRecordTypeFromStruct(dr.tableSchema.Struct)
+		} else if dr.object == DdlObjectView && dr.viewDefinition != nil {
+			return dr.viewDefinition.RecordType()
+		}
+	case DdlOpDrop, DdlOpDropIfExist:
+		return types.RecordType{}
+	}
+	return types.RecordType{}
+}
+
+func (dr *DdlRel) RecordType() types.RecordType {
+	return dr.remap(dr.directOutputSchema())
+}
+
+func (dr *DdlRel) WriteType() DdlWriteType                             { return dr.writeType }
+func (dr *DdlRel) TableSchema() types.NamedStruct                      { return dr.tableSchema }
+func (dr *DdlRel) TableDefaults() expr.Expression                      { return dr.tableDefaults }
+func (dr *DdlRel) Object() DdlObject                                   { return dr.object }
+func (dr *DdlRel) Op() DdlOp                                           { return dr.op }
+func (dr *DdlRel) ViewDefinition() Rel                                 { return dr.viewDefinition }
+func (dr *DdlRel) GetAdvancedExtension() *extensions.AdvancedExtension { return dr.advExtension }
+
+func (dr *DdlRel) ToProto() *proto.Rel {
+	ddlRel := &proto.DdlRel{
+		Common:            dr.toProto(),
+		TableSchema:       dr.tableSchema.ToProto(),
+		Object:            dr.object,
+		Op:                dr.op,
+		AdvancedExtension: dr.advExtension,
+	}
+
+	if dr.tableDefaults != nil {
+		exprProto := dr.tableDefaults.ToProto()
+		if literal := exprProto.GetLiteral(); literal != nil {
+			if structLit := literal.GetStruct(); structLit != nil {
+				ddlRel.TableDefaults = structLit
+			}
+		}
+	}
+
+	if dr.viewDefinition != nil {
+		ddlRel.ViewDefinition = dr.viewDefinition.ToProto()
+	}
+
+	switch wt := dr.writeType.(type) {
+	case *NamedObjectDdlWrite:
+		ddlRel.WriteType = &proto.DdlRel_NamedObject{
+			NamedObject: &proto.NamedObjectWrite{
+				Names:             wt.Names,
+				AdvancedExtension: wt.AdvancedExtension,
+			},
+		}
+	case *ExtensionObjectDdlWrite:
+		ddlRel.WriteType = &proto.DdlRel_ExtensionObject{
+			ExtensionObject: &proto.ExtensionObject{
+				Detail: wt.Detail,
+			},
+		}
+	}
+
+	return &proto.Rel{
+		RelType: &proto.Rel_Ddl{
+			Ddl: ddlRel,
+		},
+	}
+}
+
+func (dr *DdlRel) ToProtoPlanRel() *proto.PlanRel {
+	return &proto.PlanRel{
+		RelType: &proto.PlanRel_Rel{
+			Rel: dr.ToProto(),
+		},
+	}
+}
+
+func (dr *DdlRel) GetInputs() []Rel {
+	if dr.viewDefinition != nil {
+		return []Rel{dr.viewDefinition}
+	}
+	return []Rel{}
+}
+
+func (dr *DdlRel) Copy(newInputs ...Rel) (Rel, error) {
+	expectedInputs := len(dr.GetInputs())
+	if len(newInputs) != expectedInputs {
+		return nil, substraitgo.ErrInvalidInputCount
+	}
+
+	ddl := *dr
+	if expectedInputs == 1 {
+		ddl.viewDefinition = newInputs[0]
+	}
+	return &ddl, nil
+}
+
+func (dr *DdlRel) CopyWithExpressionRewrite(rewriteFunc RewriteFunc, newInputs ...Rel) (Rel, error) {
+	expectedInputs := len(dr.GetInputs())
+	if len(newInputs) != expectedInputs {
+		return nil, substraitgo.ErrInvalidInputCount
+	}
+
+	var err error
+	newTableDefaults := dr.tableDefaults
+	if dr.tableDefaults != nil {
+		newTableDefaults, err = rewriteFunc(dr.tableDefaults)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	inputsEqual := slices.Equal(newInputs, dr.GetInputs())
+	if newTableDefaults == dr.tableDefaults && inputsEqual {
+		return dr, nil
+	}
+
+	ddl := *dr
+	ddl.tableDefaults = newTableDefaults
+	if expectedInputs == 1 {
+		ddl.viewDefinition = newInputs[0]
+	}
+	return &ddl, nil
+}
+
+func (dr *DdlRel) Remap(mapping ...int32) (Rel, error) {
+	return RemapHelper(dr, mapping)
+}
+
+// NewDdlRel creates a new DDL relation with the specified parameters.
+func NewDdlRel(writeType DdlWriteType, tableSchema types.NamedStruct, object DdlObject, op DdlOp) *DdlRel {
+	return &DdlRel{
+		writeType:   writeType,
+		tableSchema: tableSchema,
+		object:      object,
+		op:          op,
+	}
+}
+
+// NewDdlRelWithViewDefinition creates a new DDL relation for view operations.
+func NewDdlRelWithViewDefinition(writeType DdlWriteType, object DdlObject, op DdlOp, viewDefinition Rel) *DdlRel {
+	return &DdlRel{
+		writeType:      writeType,
+		object:         object,
+		op:             op,
+		viewDefinition: viewDefinition,
+	}
+}
+
+// SetTableDefaults sets the table defaults for the DDL relation.
+func (dr *DdlRel) SetTableDefaults(tableDefaults expr.Expression) {
+	dr.tableDefaults = tableDefaults
+}
+
+// SetAdvancedExtension sets the advanced extension for the DDL relation.
+func (dr *DdlRel) SetAdvancedExtension(advExtension *extensions.AdvancedExtension) {
+	dr.advExtension = advExtension
+}
+
 var (
 	_ Rel = (*NamedTableReadRel)(nil)
 	_ Rel = (*VirtualTableReadRel)(nil)
@@ -2109,6 +2319,7 @@ var (
 	_ Rel = (*HashJoinRel)(nil)
 	_ Rel = (*MergeJoinRel)(nil)
 	_ Rel = (*NamedTableWriteRel)(nil)
+	_ Rel = (*DdlRel)(nil)
 
 	_ MultiRel = (*SetRel)(nil)
 	_ MultiRel = (*ExtensionMultiRel)(nil)

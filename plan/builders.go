@@ -5,6 +5,7 @@ package plan
 import (
 	"fmt"
 
+	"github.com/substrait-io/substrait-go/proto"
 	substraitgo "github.com/substrait-io/substrait-go/v4"
 	"github.com/substrait-io/substrait-go/v4/expr"
 	"github.com/substrait-io/substrait-go/v4/extensions"
@@ -149,6 +150,9 @@ type Builder interface {
 	// GetRelBuilder returns an expr.RelBuilder that can be used to construct
 	// relations which need multiple stages to build them.
 	GetRelBuilder() *RelBuilder
+
+	// DDL creates a DDL relation for Data Definition Language operations like CREATE TABLE, DROP VIEW, etc.
+	DDL(writeType DdlWriteType, object DdlObject, op DdlOp) *DdlRelBuilder
 }
 
 const FETCH_COUNT_ALL_RECORDS = -1
@@ -173,6 +177,10 @@ var (
 	errNoGroupingExpression    = fmt.Errorf("%w: groupings cannot contain empty expression list or nil expression", substraitgo.ErrInvalidRel)
 	errInvalidGroupingIndex    = fmt.Errorf("%w: groupingReferences contains invalid indices", substraitgo.ErrInvalidRel)
 	errCubeGroupingSizeLimit   = fmt.Errorf("cannot exceed %d grouping references for AddCube", maxGroupingSize)
+	errNilDdlWriteType         = fmt.Errorf("%w: DDL write type must not be nil", substraitgo.ErrInvalidRel)
+	errInvalidDdlObject        = fmt.Errorf("%w: DDL object must be specified", substraitgo.ErrInvalidRel)
+	errInvalidDdlOp            = fmt.Errorf("%w: DDL operation must be specified", substraitgo.ErrInvalidRel)
+	errViewDefinitionRequired  = fmt.Errorf("%w: view definition is required for view DDL operations", substraitgo.ErrInvalidRel)
 )
 
 type builder struct {
@@ -869,4 +877,170 @@ func (arb *AggregateRelBuilder) validate() error {
 	}
 
 	return nil
+}
+
+// DdlRelBuilder is a builder for constructing DDL (Data Definition Language) relations
+type DdlRelBuilder struct {
+	writeType      DdlWriteType
+	tableSchema    types.NamedStruct
+	tableDefaults  expr.Expression
+	object         DdlObject
+	op             DdlOp
+	viewDefinition Rel
+	advExtension   *extensions.AdvancedExtension
+}
+
+// SetTableSchema sets the table schema for the DDL relation
+func (drb *DdlRelBuilder) SetTableSchema(tableSchema types.NamedStruct) *DdlRelBuilder {
+	drb.tableSchema = tableSchema
+	return drb
+}
+
+// SetTableDefaults sets the table defaults for the DDL relation
+func (drb *DdlRelBuilder) SetTableDefaults(tableDefaults expr.Expression) *DdlRelBuilder {
+	drb.tableDefaults = tableDefaults
+	return drb
+}
+
+// SetViewDefinition sets the view definition for view DDL operations
+func (drb *DdlRelBuilder) SetViewDefinition(viewDefinition Rel) *DdlRelBuilder {
+	drb.viewDefinition = viewDefinition
+	return drb
+}
+
+// SetAdvancedExtension sets the advanced extension for the DDL relation
+func (drb *DdlRelBuilder) SetAdvancedExtension(advExtension *extensions.AdvancedExtension) *DdlRelBuilder {
+	drb.advExtension = advExtension
+	return drb
+}
+
+// Build constructs and returns a DdlRel from the builder
+func (drb *DdlRelBuilder) Build() (*DdlRel, error) {
+	if err := drb.validate(); err != nil {
+		return nil, err
+	}
+
+	return &DdlRel{
+		RelCommon:      RelCommon{},
+		writeType:      drb.writeType,
+		tableSchema:    drb.tableSchema,
+		tableDefaults:  drb.tableDefaults,
+		object:         drb.object,
+		op:             drb.op,
+		viewDefinition: drb.viewDefinition,
+		advExtension:   drb.advExtension,
+	}, nil
+}
+
+// validate validates the DDL relation builder
+func (drb *DdlRelBuilder) validate() error {
+	if drb.writeType == nil {
+		return errNilDdlWriteType
+	}
+
+	if drb.object == DdlObjectUnspecified {
+		return errInvalidDdlObject
+	}
+
+	if drb.op == DdlOpUnspecified {
+		return errInvalidDdlOp
+	}
+
+	// For view operations, view definition is required for CREATE operations
+	if drb.object == DdlObjectView {
+		if (drb.op == DdlOpCreate || drb.op == DdlOpCreateOrReplace) && drb.viewDefinition == nil {
+			return errViewDefinitionRequired
+		}
+	}
+
+	return nil
+}
+
+func (b *builder) InPredicateSubquery(needles []expr.Expression, haystack Rel) (*InPredicateSubquery, error) {
+	if haystack == nil {
+		return nil, errNilInputRel
+	}
+
+	if len(needles) == 0 {
+		return nil, fmt.Errorf("%w: IN predicate subquery must have at least one needle expression",
+			substraitgo.ErrInvalidExpr)
+	}
+
+	for i, needle := range needles {
+		if needle == nil {
+			return nil, fmt.Errorf("%w: needle expression %d cannot be nil",
+				substraitgo.ErrInvalidExpr, i)
+		}
+	}
+
+	// Validate that the number of needle expressions matches the number of columns in the haystack
+	haystackSchema := haystack.RecordType()
+	if len(needles) != int(haystackSchema.FieldCount()) {
+		return nil, fmt.Errorf("%w: number of needle expressions (%d) must match number of columns in haystack (%d)",
+			substraitgo.ErrInvalidExpr, len(needles), haystackSchema.FieldCount())
+	}
+
+	return NewInPredicateSubquery(needles, haystack), nil
+}
+
+// SetPredicateSubquery creates a subquery that tests for the existence or uniqueness of rows
+// in the input relation. When exists is true, it creates an EXISTS predicate that returns
+// true if the subquery returns at least one row. When exists is false, it creates a UNIQUE
+// predicate that returns true if the subquery returns at most one row.
+func (b *builder) SetPredicateSubquery(input Rel, exists bool) (*SetPredicateSubquery, error) {
+	if input == nil {
+		return nil, errNilInputRel
+	}
+
+	op := proto.Expression_Subquery_SetPredicate_PREDICATE_OP_EXISTS
+	if !exists {
+		op = proto.Expression_Subquery_SetPredicate_PREDICATE_OP_UNIQUE
+	}
+
+	return NewSetPredicateSubquery(
+		op,
+		input,
+	), nil
+}
+
+func (b *builder) ScalarSubquery(input Rel) (*ScalarSubquery, error) {
+	if input == nil {
+		return nil, errNilInputRel
+	}
+
+	return NewScalarSubquery(input), nil
+}
+
+// SetComparisonSubquery creates a subquery that compares a single expression against
+// a set of values from a relation using ANY or ALL operations with comparison operators.
+// The reductionOp determines whether to use ANY or ALL semantics, and the comparisonOp
+// specifies the comparison operator (e.g., =, !=, <, >, <=, >=).
+func (b *builder) SetComparisonSubquery(
+	left expr.Expression,
+	right Rel,
+	reductionOp proto.Expression_Subquery_SetComparison_ReductionOp,
+	comparisonOp proto.Expression_Subquery_SetComparison_ComparisonOp,
+) (*SetComparisonSubquery, error) {
+	if left == nil {
+		return nil, errNilInputRel
+	}
+	if right == nil {
+		return nil, errNilInputRel
+	}
+
+	return NewSetComparisonSubquery(
+		reductionOp,
+		comparisonOp,
+		left,
+		right,
+	), nil
+}
+
+// DDL creates a DDL relation builder for Data Definition Language operations
+func (b *builder) DDL(writeType DdlWriteType, object DdlObject, op DdlOp) *DdlRelBuilder {
+	return &DdlRelBuilder{
+		writeType: writeType,
+		object:    object,
+		op:        op,
+	}
 }
