@@ -2296,8 +2296,9 @@ func (dr *DdlRel) SetTableDefaults(tableDefaults expr.Expression) {
 }
 
 // SetAdvancedExtension sets the advanced extension for the DDL relation.
-func (dr *DdlRel) SetAdvancedExtension(advExtension *extensions.AdvancedExtension) {
+func (dr *DdlRel) SetAdvancedExtension(advExtension *extensions.AdvancedExtension) *extensions.AdvancedExtension {
 	dr.advExtension = advExtension
+	return advExtension
 }
 
 var (
